@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { randomBytes } from 'crypto';
 import { createReadStream, statSync } from 'fs';
-import { analyzeVideo, scrapeProduct, getVideoDuration } from './pipeline/analyze.js';
+import { analyzeVideo, scrapeProduct, getVideoDuration, detectMarketFromSpeech } from './pipeline/analyze.js';
 import { generateConfig } from './pipeline/generate.js';
 import { downloadVideo, renderOverlay, cleanup } from './pipeline/render.js';
 import * as defaultTemplate from './templates/default.js';
@@ -18,10 +18,11 @@ const TEMPLATES = {
 };
 
 // ── POST /render ──────────────────────────────────────────────────────────────
-// Body: { videoUrl, productUrl, template? }
+// Body: { videoUrl, productUrl, template?, market? }
+// market: 'jp' | 'mx' — override de mercado (opcional; si no se pasa, se detecta del speech)
 // Response: MP4 file stream
 app.post('/render', async (req, res) => {
-  const { videoUrl, productUrl, template: templateName = 'default' } = req.body;
+  const { videoUrl, productUrl, template: templateName = 'default', market: marketOverride } = req.body;
 
   if (!videoUrl || !productUrl) {
     return res.status(400).json({ error: 'videoUrl y productUrl son requeridos' });
@@ -46,7 +47,11 @@ app.post('/render', async (req, res) => {
       scrapeProduct(productUrl),
       getVideoDuration(videoUrl),
     ]);
-    console.log(`[${jobId}] Duración: ${duration}s | Mercado: ${product.market}`);
+
+    // Detectar mercado: override explícito > speech del video > fallback 'jp'
+    const market = marketOverride || detectMarketFromSpeech(videoAnalysis);
+    product.market = market;
+    console.log(`[${jobId}] Duración: ${duration}s | Mercado: ${market}${marketOverride ? ' (override)' : ' (auto)'}`);
 
     // 2. Generar config con LLM
     console.log(`[${jobId}] Generando config con LLM...`);
