@@ -21,9 +21,12 @@ ${JSON.stringify(videoAnalysis, null, 2)}
 
 REGLAS:
 - language: "${isJp ? 'jp' : 'mx'}"
-- hook: array de 1-2 strings (máx 14 chars cada uno para JP, 22 para ES). Hook impactante que enganche en 0-2s. Emoji al final. Amarillo glow.
+- hook: array de 1-2 strings (máx 10 chars cada uno para JP, 22 para ES). Hook impactante que enganche en 0-2s. Emoji al final. Amarillo glow.
 - features: array de exactamente 4 objetos {line1, line2}. Extraídos del video/producto. Emoji al inicio de line1.
-  ${isJp ? '- Japonés: line1 puede ser larga (kanji compacto), line2 complementa' : '- Español: ambas líneas cortas (máx 22 chars) por overflow. SIEMPRE 2 líneas.'}
+  ${isJp
+    ? '- Japonés: line1 MÁXIMO 10 caracteres totales (emoji + texto). line2 OPCIONAL (null si no hace falta). Si la info es larga, abrevia en line1 y complementa en line2. NUNCA pongas specs largas tipo "HDMI2.0×2・DP1.4・多接続対応" en una sola línea — córtalas.'
+    : '- Español: ambas líneas SIEMPRE requeridas (máx 20 chars cada una) para evitar overflow. Nunca dejes line2 null.'
+  }
 - reviews: array de exactamente 5 objetos {username, stars, text}. Inventadas pero realistas en ${isJp ? 'japonés' : 'español mexicano'}. Stars entre 4-5. Text máx 45 chars.
 - fomo: {line1, line2} — datos reales del producto (ventas, rating, etc). Sin precio.
 - cta:

@@ -68,7 +68,8 @@ Genera un overlay completo y devuelve el MP4.
 {
   "videoUrl": "https://tu-dominio.com/uploads/video.mp4",
   "productUrl": "https://ttchop.web.app/p/prod_xxx",
-  "template": "default"
+  "template": "default",
+  "market": "jp"
 }
 ```
 
@@ -77,6 +78,9 @@ Genera un overlay completo y devuelve el MP4.
 | `videoUrl` | string | ✅ | — |
 | `productUrl` | string | ✅ | — |
 | `template` | string | ❌ | `"default"` |
+| `market` | string | ❌ | auto-detect |
+
+**`market`** fuerza el mercado en lugar de auto-detectarlo del idioma del speech (`"jp"` o `"mx"`). Útil cuando el video no tiene speech o la detección falla.
 
 **Response:** archivo MP4 (stream)
 
@@ -148,7 +152,7 @@ Estilo anime con efectos de green screen (gs_anime_18, gs_anime_20, gs_anime_21)
 - 🇯🇵 Japón → muestra precio
 - 🇲🇽 México → sin precio, solo FOMO
 - Español → texto en 2 líneas para evitar overflow
-- Japonés → línea única (kanji compacto)
+- Japonés → línea única (kanji compacto), **máx 10 chars por línea** en el hook (sobrepasarlo desborda fuera de pantalla a fontSize 88)
 
 ### Agregar un template nuevo
 
