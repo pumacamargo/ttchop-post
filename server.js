@@ -99,6 +99,71 @@ app.post('/render', async (req, res) => {
   }
 });
 
+// ── POST /render-data ─────────────────────────────────────────────────────────
+// Like /render but accepts product data directly instead of a URL to scrape
+// Body: { videoUrl, product: { name, description, price?, region? }, template?, market? }
+app.post('/render-data', async (req, res) => {
+  const { videoUrl, product: productData, template: templateName = 'default', market: marketOverride } = req.body;
+
+  if (!videoUrl || !productData) {
+    return res.status(400).json({ error: 'videoUrl y product son requeridos' });
+  }
+
+  const template = TEMPLATES[templateName];
+  if (!template) {
+    return res.status(400).json({ error: `Template "${templateName}" no existe.` });
+  }
+
+  const jobId = randomBytes(6).toString('hex');
+  let videoFile = null;
+  let outPath   = null;
+
+  console.log(`[${jobId}] START (render-data) — ${templateName} | ${videoUrl}`);
+
+  try {
+    const [videoAnalysis, duration] = await Promise.all([
+      analyzeVideo(videoUrl),
+      getVideoDuration(videoUrl),
+    ]);
+
+    const market = marketOverride || (productData.region === 'mx' ? 'mx' : 'jp');
+    const product = {
+      url: null,
+      price: productData.price || null,
+      rawText: `${productData.name || ''}\n${productData.description || ''}`.slice(0, 3000),
+      market,
+    };
+
+    console.log(`[${jobId}] Duración: ${duration}s | Mercado: ${market}`);
+
+    const overlayConfig = await generateConfig({ videoAnalysis, product, template });
+    videoFile = await downloadVideo(videoUrl, jobId);
+
+    const props = { videoFile, duration, ...overlayConfig };
+
+    console.log(`[${jobId}] Renderizando ${Math.round(duration * 25)} frames...`);
+    outPath = await renderOverlay({ compositionId: template.COMPOSITION_ID, config: props, jobId });
+
+    const stat = statSync(outPath);
+    console.log(`[${jobId}] DONE — ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="overlay_${jobId}.mp4"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Job-Id', jobId);
+
+    const stream = createReadStream(outPath);
+    stream.pipe(res);
+    stream.on('end', () => cleanup(videoFile, outPath));
+    stream.on('error', (e) => { console.error(e); cleanup(videoFile, outPath); });
+
+  } catch (err) {
+    console.error(`[${jobId}] ERROR:`, err.message);
+    cleanup(videoFile, outPath);
+    if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
+  }
+});
+
 // ── GET /health ───────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   status: 'ok',
