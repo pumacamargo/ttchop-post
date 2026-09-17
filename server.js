@@ -101,12 +101,17 @@ app.post('/render', async (req, res) => {
 
 // ── POST /render-data ─────────────────────────────────────────────────────────
 // Like /render but accepts product data directly instead of a URL to scrape
-// Body: { videoUrl, product: { name, description, price?, region? }, template?, market? }
+// Body: { videoUrl, product: { name, description, price?, region? }, template?, market?, mascotSegments? }
+// mascotSegments: array opcional { startSec, endSec, url, type } — se pasa tal cual a Remotion
 app.post('/render-data', async (req, res) => {
-  const { videoUrl, product: productData, template: templateName = 'default', market: marketOverride } = req.body;
+  const { videoUrl, product: productData, template: templateName = 'default', market: marketOverride, mascotSegments } = req.body;
 
   if (!videoUrl || !productData) {
     return res.status(400).json({ error: 'videoUrl y product son requeridos' });
+  }
+
+  if (mascotSegments !== undefined && !Array.isArray(mascotSegments)) {
+    return res.status(400).json({ error: 'mascotSegments debe ser un array' });
   }
 
   const template = TEMPLATES[templateName];
@@ -140,6 +145,9 @@ app.post('/render-data', async (req, res) => {
     videoFile = await downloadVideo(videoUrl, jobId);
 
     const props = { videoFile, duration, ...overlayConfig };
+    if (mascotSegments) {
+      props.mascotSegments = mascotSegments;
+    }
 
     console.log(`[${jobId}] Renderizando ${Math.round(duration * 25)} frames...`);
     outPath = await renderOverlay({ compositionId: template.COMPOSITION_ID, config: props, jobId });
