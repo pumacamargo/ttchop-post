@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { createWriteStream, unlinkSync, existsSync } from 'fs';
+import { createWriteStream, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { pipeline } from 'stream/promises';
 import fetch from 'node-fetch';
 import path from 'path';
@@ -12,6 +12,11 @@ const ENTRY        = `${REMOTION_DIR}/index.ts`;
 export async function downloadVideo(videoUrl, jobId) {
   const filename = `auto_${jobId}.mp4`;
   const destPath = path.join(PUBLIC_DIR, filename);
+
+  // Defensivo: public/ está en .gitignore de cacho_inmotion (se rellena en runtime),
+  // así que un clone fresco del repo no la trae. Sin esto, cualquier reclonación
+  // (ej. tras corrupción de .git) tumba todos los renders con ENOENT.
+  if (!existsSync(PUBLIC_DIR)) mkdirSync(PUBLIC_DIR, { recursive: true });
 
   const res = await fetch(videoUrl);
   if (!res.ok) throw new Error(`Error descargando video: ${res.status}`);
