@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { createReadStream, statSync } from 'fs';
 import { analyzeVideo, scrapeProduct, getVideoDuration, detectMarketFromSpeech } from './pipeline/analyze.js';
 import { generateConfig } from './pipeline/generate.js';
-import { downloadVideo, renderOverlay, cleanup } from './pipeline/render.js';
+import { downloadVideo, downloadMascotAssets, renderOverlay, cleanup } from './pipeline/render.js';
 import * as defaultTemplate from './templates/default.js';
 
 const app  = express();
@@ -122,6 +122,7 @@ app.post('/render-data', async (req, res) => {
   const jobId = randomBytes(6).toString('hex');
   let videoFile = null;
   let outPath   = null;
+  let mascotFilenames = [];
 
   console.log(`[${jobId}] START (render-data) — ${templateName} | ${videoUrl}`);
 
@@ -146,7 +147,12 @@ app.post('/render-data', async (req, res) => {
 
     const props = { videoFile, duration, ...overlayConfig };
     if (mascotSegments) {
-      props.mascotSegments = mascotSegments;
+      // Descarga cada asset de mascota a public/ (mismo tratamiento que videoFile) para
+      // que el colorKey en tiempo real de MascotOverlay.jsx funcione -- una URL remota
+      // choca con CORS en el navegador del renderer y Remotion cae a un modo sin efectos.
+      const { segments, filenames } = await downloadMascotAssets(mascotSegments, jobId);
+      props.mascotSegments = segments;
+      mascotFilenames = filenames;
     }
 
     console.log(`[${jobId}] Renderizando ${Math.round(duration * 25)} frames...`);
@@ -162,12 +168,12 @@ app.post('/render-data', async (req, res) => {
 
     const stream = createReadStream(outPath);
     stream.pipe(res);
-    stream.on('end', () => cleanup(videoFile, outPath));
-    stream.on('error', (e) => { console.error(e); cleanup(videoFile, outPath); });
+    stream.on('end', () => cleanup(videoFile, outPath, mascotFilenames));
+    stream.on('error', (e) => { console.error(e); cleanup(videoFile, outPath, mascotFilenames); });
 
   } catch (err) {
     console.error(`[${jobId}] ERROR:`, err.message);
-    cleanup(videoFile, outPath);
+    cleanup(videoFile, outPath, mascotFilenames);
     if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
   }
 });

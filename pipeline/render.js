@@ -25,6 +25,44 @@ export async function downloadVideo(videoUrl, jobId) {
   return filename; // solo el nombre, para staticFile()
 }
 
+// Descarga cualquier asset (imagen o video) a public/, igual que downloadVideo.
+// Usado para los mascotSegments: el colorKey en tiempo real de MascotOverlay.jsx
+// (igual que el de los FX de green screen) solo funciona con assets servidos desde
+// el mismo origen (staticFile) -- una URL remota de Firebase Storage choca con CORS
+// en el navegador del renderer y Remotion cae a un modo sin efectos. Descargarlo
+// local antes de renderizar evita el problema por completo.
+async function downloadAsset(url, filename) {
+  const destPath = path.join(PUBLIC_DIR, filename);
+  if (!existsSync(PUBLIC_DIR)) mkdirSync(PUBLIC_DIR, { recursive: true });
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Error descargando asset de mascota: ${res.status}`);
+  await pipeline(res.body, createWriteStream(destPath));
+  return filename;
+}
+
+// Descarga todos los mascotSegments a public/ y devuelve una copia del array con
+// `url` reemplazado por el nombre de archivo local (para usar con staticFile()).
+// No falla el render completo si un asset individual no se puede descargar --
+// esa línea simplemente no muestra mascota, mejor que tumbar todo el video.
+export async function downloadMascotAssets(mascotSegments, jobId) {
+  if (!Array.isArray(mascotSegments) || mascotSegments.length === 0) return [];
+  const localSegments = [];
+  const downloadedFilenames = [];
+  for (let i = 0; i < mascotSegments.length; i++) {
+    const seg = mascotSegments[i];
+    const ext = seg.type === 'video' ? 'mp4' : 'png';
+    const filename = `mascot_${jobId}_${i}.${ext}`;
+    try {
+      await downloadAsset(seg.url, filename);
+      localSegments.push({ ...seg, url: filename });
+      downloadedFilenames.push(filename);
+    } catch (e) {
+      console.warn(`[${jobId}] No se pudo descargar mascot segment ${i}:`, e.message);
+    }
+  }
+  return { segments: localSegments, filenames: downloadedFilenames };
+}
+
 // Renderiza el overlay con Remotion CLI
 export async function renderOverlay({ compositionId, config, jobId }) {
   const outPath = `/tmp/ttchop_post_${jobId}.mp4`;
@@ -38,10 +76,15 @@ export async function renderOverlay({ compositionId, config, jobId }) {
 }
 
 // Limpia archivos temporales después de enviar la respuesta
-export function cleanup(videoFile, outPath) {
+// mascotFilenames: opcional, nombres devueltos por downloadMascotAssets.
+export function cleanup(videoFile, outPath, mascotFilenames = []) {
   try {
     if (videoFile) {
       const fullPath = path.join(PUBLIC_DIR, videoFile);
+      if (existsSync(fullPath)) unlinkSync(fullPath);
+    }
+    for (const f of mascotFilenames) {
+      const fullPath = path.join(PUBLIC_DIR, f);
       if (existsSync(fullPath)) unlinkSync(fullPath);
     }
     if (outPath && existsSync(outPath)) unlinkSync(outPath);
