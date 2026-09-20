@@ -1,10 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import { randomBytes } from 'crypto';
-import { createReadStream, statSync } from 'fs';
+import { createReadStream, statSync, unlinkSync } from 'fs';
 import { analyzeVideo, scrapeProduct, getVideoDuration, detectMarketFromSpeech } from './pipeline/analyze.js';
 import { generateConfig } from './pipeline/generate.js';
-import { downloadVideo, downloadMascotAssets, renderOverlay, cleanup } from './pipeline/render.js';
+import { downloadVideo, downloadMascotAssets, renderOverlay, applyMascotWithFfmpeg, uploadBaseOverlay, cleanup, ensureGreenScreenAssets } from './pipeline/render.js';
 import * as defaultTemplate from './templates/default.js';
 
 const app  = express();
@@ -40,6 +40,9 @@ app.post('/render', async (req, res) => {
   console.log(`[${jobId}] START — ${templateName} | ${videoUrl}`);
 
   try {
+    // 0. Garantizar green screen assets locales (CORS impide URLs remotas en Remotion)
+    await ensureGreenScreenAssets();
+
     // 1. Análisis en paralelo
     console.log(`[${jobId}] Analizando video y producto...`);
     const [videoAnalysis, product, duration] = await Promise.all([
@@ -127,6 +130,8 @@ app.post('/render-data', async (req, res) => {
   console.log(`[${jobId}] START (render-data) — ${templateName} | ${videoUrl}`);
 
   try {
+    await ensureGreenScreenAssets();
+
     const [videoAnalysis, duration] = await Promise.all([
       analyzeVideo(videoUrl),
       getVideoDuration(videoUrl),
@@ -146,17 +151,29 @@ app.post('/render-data', async (req, res) => {
     videoFile = await downloadVideo(videoUrl, jobId);
 
     const props = { videoFile, duration, ...overlayConfig };
+    let localMascotSegments = [];
     if (mascotSegments) {
-      // Descarga cada asset de mascota a public/ (mismo tratamiento que videoFile) para
-      // que el colorKey en tiempo real de MascotOverlay.jsx funcione -- una URL remota
-      // choca con CORS en el navegador del renderer y Remotion cae a un modo sin efectos.
+      // Descarga cada asset de mascota a public/ (caché de remove.bg en Firebase).
+      // NO se pasa a Remotion — el compositing lo hace ffmpeg después del render,
+      // lo que es 10-20x más rápido que el colorKey frame-by-frame de Remotion.
       const { segments, filenames } = await downloadMascotAssets(mascotSegments, jobId);
-      props.mascotSegments = segments;
+      localMascotSegments = segments;
       mascotFilenames = filenames;
     }
 
     console.log(`[${jobId}] Renderizando ${Math.round(duration * 25)} frames...`);
     outPath = await renderOverlay({ compositionId: template.COMPOSITION_ID, config: props, jobId });
+
+    // Aplicar mascota con ffmpeg (rápido) si hay segmentos
+    let baseOverlayUrl = null;
+    if (localMascotSegments.length > 0) {
+      const baseOutPath = outPath;
+      // Subir base overlay a Firebase antes de ffmpeg para poder re-aplicar mascota después
+      baseOverlayUrl = await uploadBaseOverlay(baseOutPath, jobId);
+      outPath = `/tmp/ttchop_post_${jobId}_mascot.mp4`;
+      await applyMascotWithFfmpeg(baseOutPath, outPath, localMascotSegments, jobId);
+      try { unlinkSync(baseOutPath); } catch {}
+    }
 
     const stat = statSync(outPath);
     console.log(`[${jobId}] DONE — ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
@@ -165,6 +182,8 @@ app.post('/render-data', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="overlay_${jobId}.mp4"`);
     res.setHeader('Content-Length', stat.size);
     res.setHeader('X-Job-Id', jobId);
+    if (baseOverlayUrl) res.setHeader('X-Base-Overlay-Url', baseOverlayUrl);
+    if (mascotSegments)  res.setHeader('X-Mascot-Segments', Buffer.from(JSON.stringify(mascotSegments)).toString('base64'));
 
     const stream = createReadStream(outPath);
     stream.pipe(res);
@@ -174,6 +193,59 @@ app.post('/render-data', async (req, res) => {
   } catch (err) {
     console.error(`[${jobId}] ERROR:`, err.message);
     cleanup(videoFile, outPath, mascotFilenames);
+    if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
+  }
+});
+
+// ── POST /apply-mascot ────────────────────────────────────────────────────────
+// Re-aplica mascota con ffmpeg sobre un base overlay ya guardado.
+// Body: { baseOverlayUrl, mascotSegments, jobId? }
+// Devuelve el MP4 resultante como stream.
+app.post('/apply-mascot', async (req, res) => {
+  const { baseOverlayUrl, mascotSegments: segs, jobId: reqJobId } = req.body;
+  if (!baseOverlayUrl || !Array.isArray(segs) || segs.length === 0) {
+    return res.status(400).json({ error: 'baseOverlayUrl y mascotSegments son requeridos' });
+  }
+
+  const jobId = reqJobId || randomBytes(6).toString('hex');
+  let outPath = null;
+  let mascotFilenames = [];
+
+  console.log(`[${jobId}] /apply-mascot START — ${segs.length} segmentos`);
+  try {
+    // 1. Descargar base overlay
+    const basePath = `/tmp/ttchop_base_${jobId}.mp4`;
+    const baseRes = await (await import('node-fetch')).default(baseOverlayUrl);
+    if (!baseRes.ok) throw new Error(`Error descargando base overlay: ${baseRes.status}`);
+    const { createWriteStream } = await import('fs');
+    const { pipeline: streamPipeline } = await import('stream/promises');
+    await streamPipeline(baseRes.body, createWriteStream(basePath));
+
+    // 2. Descargar mascot assets (con caché de remove.bg)
+    const { segments, filenames } = await downloadMascotAssets(segs, jobId);
+    mascotFilenames = filenames;
+    outPath = `/tmp/ttchop_post_${jobId}_mascot.mp4`;
+
+    // 3. ffmpeg mascota
+    await applyMascotWithFfmpeg(basePath, outPath, segments, jobId);
+    try { unlinkSync(basePath); } catch {}
+
+    const stat = statSync(outPath);
+    console.log(`[${jobId}] /apply-mascot DONE — ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="overlay_mascot_${jobId}.mp4"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Job-Id', jobId);
+
+    const stream = createReadStream(outPath);
+    stream.pipe(res);
+    stream.on('end', () => cleanup(null, outPath, mascotFilenames));
+    stream.on('error', (e) => { console.error(e); cleanup(null, outPath, mascotFilenames); });
+
+  } catch (err) {
+    console.error(`[${jobId}] /apply-mascot ERROR:`, err.message);
+    cleanup(null, outPath, mascotFilenames);
     if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
   }
 });
