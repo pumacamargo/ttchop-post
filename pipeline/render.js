@@ -33,7 +33,7 @@ function getMascotBucket() {
   return _storageBucket;
 }
 
-const REMOTION_DIR = '/tmp/cacho_inmotion';
+const REMOTION_DIR = '/root/projects/ttchop/ttchop-post_templates';
 const PUBLIC_DIR   = `${REMOTION_DIR}/public`;
 const ENTRY        = `${REMOTION_DIR}/index.ts`;
 
@@ -66,7 +66,7 @@ export async function downloadVideo(videoUrl, jobId) {
   const filename = `auto_${jobId}.mp4`;
   const destPath = path.join(PUBLIC_DIR, filename);
 
-  // Defensivo: public/ está en .gitignore de cacho_inmotion (se rellena en runtime),
+  // Defensivo: public/ está en .gitignore de ttchop-post_templates (se rellena en runtime),
   // así que un clone fresco del repo no la trae. Sin esto, cualquier reclonación
   // (ej. tras corrupción de .git) tumba todos los renders con ENOENT.
   if (!existsSync(PUBLIC_DIR)) mkdirSync(PUBLIC_DIR, { recursive: true });
@@ -260,6 +260,106 @@ export async function renderOverlay({ compositionId, config, jobId }) {
   execSync(cmd, { timeout: 1_800_000, stdio: 'inherit' });
 
   return outPath;
+}
+
+// ── Personaje animado (Rive + character-clip) ──────────────────────────────────
+// Verde de fondo del personaje — DEBE coincidir con CHARACTER_GREEN en CharacterClip.jsx.
+const CHARACTER_GREEN = '0x00b140';
+const CHARACTER_RIV_NAME = 'aato02.riv';
+
+// Descarga el .riv del personaje a public/ si no está ya ahí. Fuente de verdad:
+// Firebase Storage character/aato01_jointtest01.riv (bucket ttchop2, vía admin SDK
+// igual que el caché de mascotas — no depende de que el bucket sea público).
+export async function ensureCharacterAssets() {
+  const localPath = path.join(PUBLIC_DIR, CHARACTER_RIV_NAME);
+  if (existsSync(localPath)) return;
+  if (!existsSync(PUBLIC_DIR)) mkdirSync(PUBLIC_DIR, { recursive: true });
+  console.log('[character] Descargando .riv desde Firebase Storage...');
+  const bucket = getMascotBucket();
+  const [contents] = await bucket.file(`character/${CHARACTER_RIV_NAME}`).download();
+  writeFileSync(localPath, contents);
+  console.log('[character] .riv listo');
+}
+
+// Renderiza el personaje (composición "character-clip") sobre fondo verde con Remotion CLI.
+// props: { rivFile, audioFile, duration, mouthCues, browCues, bodyCues, blinkTimes }
+// rivFile y audioFile deben estar ya en PUBLIC_DIR (usar staticFile() del lado de Remotion).
+export async function renderCharacterClip({ props, jobId, frames }) {
+  const outPath = `/tmp/character_${jobId}.mp4`;
+  const propsJson = JSON.stringify(props).replace(/'/g, "'\\''");
+  const framesFlag = frames ? `--frames=0-${frames - 1}` : '';
+  const cmd = `cd ${REMOTION_DIR} && npx remotion render ${ENTRY} character-clip ${outPath} --props='${propsJson}' --concurrency=1 ${framesFlag}`.trim();
+  execSync(cmd, { timeout: 1_800_000, stdio: 'inherit' });
+  return outPath;
+}
+
+// Compone el clip del personaje (fondo verde) sobre el video base con chromakey de ffmpeg.
+// NO usa el audio del clip del personaje — el video base ya trae el audio final del diálogo
+// (viene del collage), meter el audio del personaje otra vez causaría eco.
+// W/MARGIN: mismos valores que MascotOverlay.jsx / applyMascotWithFfmpeg (abajo, centrado horizontal).
+export async function applyCharacterWithFfmpeg(inputPath, outputPath, characterClipPath, jobId, duration, variant = 'a', forceDuration = null) {
+  let W, OX, OY;
+  if (variant === 'b') {
+    // Variante B: VTuber esquina inferior derecha.
+    // W=1053 (mismo tamaño). OX=350 hace que el canvas desborde por la derecha
+    // y el personaje quede visible en la mitad derecha de la pantalla.
+    // OY=867 → pies al borde inferior de pantalla.
+    W  = Math.round(1080 * 0.65 * 1.5); // 1053px
+    OX = 200;
+    OY = 1100; // medium shot — corta de cintura para abajo
+  } else {
+    const MARGIN = 0;
+    W  = Math.round(1080 * 0.65); // 702px
+    OX = Math.round((1080 - W) / 2);
+    OY = 1920 - W - MARGIN;
+  }
+
+  // `duration` es la duración del diálogo del PERSONAJE (su propio TTS), no la del
+  // audio real del video base (que es el que queda en el output vía -map 0:a). Si el
+  // guion del personaje es más corto que el del video base (caso típico: el collage
+  // ya trae su propio diálogo, más largo), usar `duration` como -t cortaba el audio
+  // real a la mitad de la frase. Usamos la duración real del video base (o la del
+  // personaje si por algún motivo es más larga) para nunca truncar el audio real.
+  const probeCmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
+  const baseDuration = parseFloat(execSync(probeCmd).toString().trim()) || duration;
+  const finalDuration = forceDuration ?? Math.max(duration, baseDuration);
+
+  // Mismo truco de sombra que applyMascotWithFfmpeg: split el personaje ya keado en
+  // imagen + fuente de sombra, la sombra se pone toda negra con 75% del alpha original
+  // + blur, y se overlea offseteada ANTES que la imagen real (drop-shadow(14px 18px 10px
+  // rgba(0,0,0,0.75)), igual que MascotOverlay.jsx).
+  const SHADOW_DX = 14;
+  const SHADOW_DY = 18;
+
+  // despill quita el tinte verde que queda pegado en los bordes por el antialiasing
+  // del chromakey — sin esto se ve un fleco verde delgado alrededor del personaje.
+  const filterComplex = [
+    `[1:v]chromakey=${CHARACTER_GREEN}:0.10:0.05,despill=type=green:mix=0.5:expand=0,scale=${W}:${W},format=rgba,split=2[img][shadSrc]`,
+    `[shadSrc]colorchannelmixer=rr=0:rg=0:rb=0:ra=0:gr=0:gg=0:gb=0:ga=0:br=0:bg=0:bb=0:ba=0:ar=0:ag=0:ab=0:aa=0.75,gblur=sigma=5[shadow]`,
+    `[0:v][shadow]overlay=${OX + SHADOW_DX}:${OY + SHADOW_DY}[vshadow]`,
+    `[vshadow][img]overlay=${OX}:${OY}[vout]`,
+  ].join(';');
+
+  // -stream_loop -1 hace infinito el input 0 (video base) para que alcance a cubrir
+  // audio/personaje más largos. Con un input infinito, "-shortest" NO corta el output
+  // (el overlay filter repite el último frame del input corto pero nunca da EOF real,
+  // así que ffmpeg nunca termina solo) — hay que forzar el corte con "-t duration".
+  const cmd = [
+    'ffmpeg',
+    '-stream_loop -1',
+    `-i "${inputPath}"`,
+    `-i "${characterClipPath}"`,
+    `-filter_complex "${filterComplex}"`,
+    '-map "[vout]" -map 0:a',
+    `-t ${finalDuration}`,
+    '-c:v libx264 -preset fast -crf 18',
+    '-c:a aac -b:a 192k', // -c:a copy falla porque el loop reinicia el stream de audio
+    `-y "${outputPath}"`,
+  ].join(' ');
+
+  console.log(`[${jobId}] ffmpeg personaje: componiendo...`);
+  execSync(cmd, { timeout: 1_800_000, stdio: 'inherit' });
+  console.log(`[${jobId}] ffmpeg personaje: listo`);
 }
 
 // Limpia archivos temporales después de enviar la respuesta

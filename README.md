@@ -22,7 +22,7 @@ videoUrl + productUrl
 
 - Node.js 18+
 - ffprobe (para detectar duración del video)
-- [Remotion](https://www.remotion.dev/) instalado en `/tmp/cacho_inmotion`
+- [Remotion](https://www.remotion.dev/) instalado en `/root/projects/ttchop/ttchop-post_templates`
 - Cuenta en [OpenRouter](https://openrouter.ai/)
 - PM2 (para correr en producción)
 
@@ -178,7 +178,7 @@ const TEMPLATES = {
 };
 ```
 
-3. Crear el componente Remotion correspondiente en `/tmp/cacho_inmotion/src/`
+3. Crear el componente Remotion correspondiente en `/root/projects/ttchop/ttchop-post_templates/src/`
 
 4. Usarlo:
 ```bash

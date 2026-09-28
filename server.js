@@ -1,16 +1,19 @@
 import 'dotenv/config';
 import express from 'express';
 import { randomBytes } from 'crypto';
-import { createReadStream, statSync, unlinkSync } from 'fs';
+import { createReadStream, createWriteStream, statSync, unlinkSync, existsSync } from 'fs';
 import { analyzeVideo, scrapeProduct, getVideoDuration, detectMarketFromSpeech } from './pipeline/analyze.js';
 import { generateConfig } from './pipeline/generate.js';
-import { downloadVideo, downloadMascotAssets, renderOverlay, applyMascotWithFfmpeg, uploadBaseOverlay, cleanup, ensureGreenScreenAssets } from './pipeline/render.js';
+import { downloadVideo, downloadMascotAssets, renderOverlay, applyMascotWithFfmpeg, uploadBaseOverlay, cleanup, ensureGreenScreenAssets, ensureCharacterAssets, renderCharacterClip, applyCharacterWithFfmpeg } from './pipeline/render.js';
 import * as defaultTemplate from './templates/default.js';
+import path from 'path';
+import { writeFileSync, mkdirSync } from 'fs';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(express.json());
+// audioBase64 en /character/render puede pesar varios MB — el default de 100kb no alcanza.
+app.use(express.json({ limit: '50mb' }));
 
 // Mapa de templates disponibles
 const TEMPLATES = {
@@ -246,6 +249,81 @@ app.post('/apply-mascot', async (req, res) => {
   } catch (err) {
     console.error(`[${jobId}] /apply-mascot ERROR:`, err.message);
     cleanup(null, outPath, mascotFilenames);
+    if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
+  }
+});
+
+// ── POST /character/render ──────────────────────────────────────────────────────
+// Renderiza el personaje (Rive) sobre fondo verde y lo compone con chromakey+despill
+// sobre un video base (el overlay ya renderizado por /render-data). Devuelve el MP4.
+// Body: { videoUrl, audioBase64, audioExt?, duration, mouthCues, browCues, bodyCues, blinkTimes? }
+// audioExt: 'wav' | 'mp3' — default 'wav'. mouthCues/browCues/bodyCues: [{start,end,value}].
+app.post('/character/render', async (req, res) => {
+  const { videoUrl, audioBase64, audioExt = 'wav', duration, mouthCues, browCues, bodyCues, blinkTimes = [], variant = 'a', testSeconds } = req.body;
+
+  if (!videoUrl || !audioBase64 || !duration || !mouthCues) {
+    return res.status(400).json({ error: 'videoUrl, audioBase64, duration y mouthCues son requeridos' });
+  }
+
+  const jobId = randomBytes(6).toString('hex');
+  const PUBLIC_DIR = path.join('/root/projects/ttchop/ttchop-post_templates', 'public');
+  const audioFile = `character_audio_${jobId}.${audioExt}`;
+  const basePath = `/tmp/character_base_${jobId}.mp4`;
+  let characterClipPath = null;
+  let outPath = null;
+
+  const renderDuration = testSeconds ? Math.min(duration, testSeconds) : duration;
+  const testFrames = testSeconds ? Math.round(testSeconds * 60) : null; // Remotion corre a 60fps
+  console.log(`[${jobId}] /character/render START | duration=${duration}s${testSeconds ? ` (TEST ${testSeconds}s)` : ''} | variant=${variant}`);
+
+  try {
+    await ensureCharacterAssets();
+    if (!existsSync(PUBLIC_DIR)) mkdirSync(PUBLIC_DIR, { recursive: true });
+
+    // Audio del personaje → public/ (Remotion lo necesita ahí para staticFile())
+    writeFileSync(path.join(PUBLIC_DIR, audioFile), Buffer.from(audioBase64, 'base64'));
+
+    // Video base a componer (el overlay ya renderizado)
+    const baseRes = await (await import('node-fetch')).default(videoUrl);
+    if (!baseRes.ok) throw new Error(`Error descargando video base: ${baseRes.status}`);
+    const { pipeline: streamPipeline } = await import('stream/promises');
+    await streamPipeline(baseRes.body, createWriteStream(basePath));
+
+    // Render del personaje sobre fondo verde
+    console.log(`[${jobId}] Renderizando personaje...`);
+    characterClipPath = await renderCharacterClip({
+      props: { rivFile: 'aato02.riv', audioFile, duration: renderDuration, mouthCues, browCues, bodyCues, blinkTimes },
+      jobId,
+      frames: testFrames,
+    });
+
+    // Compositing con chromakey + despill
+    outPath = `/tmp/character_out_${jobId}.mp4`;
+    await applyCharacterWithFfmpeg(basePath, outPath, characterClipPath, jobId, renderDuration, variant, testSeconds ? renderDuration : null);
+
+    const stat = statSync(outPath);
+    console.log(`[${jobId}] DONE — ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="character_${jobId}.mp4"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Job-Id', jobId);
+
+    const stream = createReadStream(outPath);
+    stream.pipe(res);
+    const cleanupFiles = () => {
+      for (const f of [basePath, characterClipPath, outPath, path.join(PUBLIC_DIR, audioFile)]) {
+        try { if (f && existsSync(f)) unlinkSync(f); } catch {}
+      }
+    };
+    stream.on('end', cleanupFiles);
+    stream.on('error', (e) => { console.error(e); cleanupFiles(); });
+
+  } catch (err) {
+    console.error(`[${jobId}] /character/render ERROR:`, err.message);
+    for (const f of [basePath, characterClipPath, outPath, path.join(PUBLIC_DIR, audioFile)]) {
+      try { if (f && existsSync(f)) unlinkSync(f); } catch {}
+    }
     if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
   }
 });
