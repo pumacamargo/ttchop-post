@@ -8,6 +8,8 @@ import { downloadVideo, downloadMascotAssets, renderOverlay, applyMascotWithFfmp
 import * as defaultTemplate from './templates/default.js';
 import path from 'path';
 import { writeFileSync, mkdirSync } from 'fs';
+import { renderCarouselSlides, zipSlides } from './pipeline/carouselRender.js';
+import { enqueue as enqueueCarouselJob } from './pipeline/jobQueue.js';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -324,6 +326,52 @@ app.post('/character/render', async (req, res) => {
     for (const f of [basePath, characterClipPath, outPath, path.join(PUBLIC_DIR, audioFile)]) {
       try { if (f && existsSync(f)) unlinkSync(f); } catch {}
     }
+    if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
+  }
+});
+
+// ── POST /carousel/render-slides ──────────────────────────────────────────────
+// TTC-56 Fase 2. Body: { jobId, width?, height?, slides:[{index,bgUrl,text,role}], style }
+// Renderiza cada slide como still (CarouselSlide en ttchop-post_templates) con
+// bundle() una sola vez por job + renderStill() por slide (plan TTC-55 §2/§9 Fase 2).
+// Devuelve un ZIP (slide_{index}.png por cada uno) como stream — ttchop-server es
+// quien sabe a qué proyecto (ttchop/ttchop2) subir cada archivo a Storage, así que
+// esta ruta nunca toca Firestore ni Storage directamente, solo renderiza y entrega
+// el binario (mismo patrón que /render, /render-data, /character/render).
+app.post('/carousel/render-slides', async (req, res) => {
+  const { jobId, slides, style } = req.body;
+  if (!jobId || !Array.isArray(slides) || slides.length === 0) {
+    return res.status(400).json({ error: 'jobId y slides (array) son requeridos' });
+  }
+
+  console.log(`[carousel] /render-slides START — jobId=${jobId} | ${slides.length} slides`);
+  let outputs = [];
+  let zipPath = null;
+
+  try {
+    outputs = await enqueueCarouselJob(jobId, () => renderCarouselSlides({ jobId, slides, style }));
+    zipPath = await zipSlides(jobId, outputs);
+
+    const stat = statSync(zipPath);
+    console.log(`[carousel] [${jobId}] DONE — zip ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="carousel_${jobId}.zip"`);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Slide-Indices', outputs.map(o => o.index).join(','));
+
+    const stream = createReadStream(zipPath);
+    stream.pipe(res);
+    const cleanupFiles = () => {
+      for (const o of outputs) { try { unlinkSync(o.path); } catch {} }
+      try { if (zipPath) unlinkSync(zipPath); } catch {}
+    };
+    stream.on('end', cleanupFiles);
+    stream.on('error', (e) => { console.error(e); cleanupFiles(); });
+  } catch (err) {
+    console.error(`[carousel] [${jobId}] /render-slides ERROR:`, err.message);
+    for (const o of outputs) { try { unlinkSync(o.path); } catch {} }
+    try { if (zipPath) unlinkSync(zipPath); } catch {}
     if (!res.headersSent) res.status(500).json({ error: err.message, jobId });
   }
 });
